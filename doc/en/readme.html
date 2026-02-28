@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<title>Discord Enhancements for NVDA — User Guide</title>
+	<style>
+		body { font-family: sans-serif; max-width: 50em; margin: 2em auto; line-height: 1.6; }
+		h1, h2, h3 { margin-top: 1.5em; }
+		table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+		th, td { border: 1px solid #999; padding: 0.4em 0.8em; text-align: left; }
+		th { background: #eee; }
+		kbd { background: #f4f4f4; border: 1px solid #ccc; border-radius: 3px; padding: 0.1em 0.4em; font-size: 0.95em; }
+		code { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; }
+		.note { background: #ffc; border-left: 4px solid #cc0; padding: 0.8em 1em; margin: 1em 0; }
+	</style>
+</head>
+<body>
+
+<h1>Discord Enhancements for NVDA</h1>
+<p>Version 1.0.0</p>
+
+<p>
+	This add-on enhances the experience of using the Discord Windows
+	desktop application with the NVDA screen reader.  It is inspired by
+	<a href="https://dlee.org/discord">Doug Lee's JAWS scripts for Discord</a>
+	and brings a similar command-layer navigation system to NVDA.
+</p>
+
+<hr>
+
+<h2>Key Concepts</h2>
+
+<h3>Browse Mode</h3>
+<p>
+	Discord is an Electron (Chromium) application.  By default, NVDA would
+	present it in browse mode with virtual-cursor navigation, which can be
+	confusing.  This add-on <strong>disables browse mode by default</strong>
+	so you interact with Discord's own controls directly.
+</p>
+<p>
+	You can still toggle browse mode at any time with
+	<kbd>NVDA+Space</kbd> if you need virtual-cursor access.
+</p>
+
+<h3>The Command Layer (Prefix Key)</h3>
+<p>
+	Most features are accessed through a <em>command layer</em>.  Press
+	the <strong>prefix key</strong> (default: <kbd>[</kbd>), then press a
+	follow-up key to run a command.  For example, press <kbd>[</kbd>
+	then <kbd>A</kbd> to hear the Active Now section.
+</p>
+<ul>
+	<li>A short high-pitched tone plays when the layer is entered.</li>
+	<li>A short low-pitched tone plays when a command is executed or the layer exits.</li>
+	<li>Press <kbd>Escape</kbd> to cancel without running a command.</li>
+	<li>Press the prefix key <strong>twice quickly</strong> to type it as a literal character.</li>
+	<li>The layer auto-cancels after 5 seconds of inactivity.</li>
+	<li>When you are typing in a message box the prefix key is passed through normally.</li>
+</ul>
+
+<h3>Exploring Commands with Tab</h3>
+<p>
+	While the command layer is active, press <kbd>Tab</kbd> or
+	<kbd>Shift+Tab</kbd> to cycle through all available commands.
+	NVDA will announce the key and description of each command.
+	Press <kbd>Enter</kbd> to execute the last announced command.
+	A wrap-around tone plays when you reach the end or beginning of the list.
+</p>
+
+<h3>Window Title</h3>
+<p>
+	When the Discord window is focused, NVDA reports the title with a
+	<em>window</em> suffix (e.g. "My Server — Discord window").
+	Pressing <kbd>NVDA+T</kbd> gives an enhanced title that includes
+	server name, channel, mute/deafen status, voice channel, badge
+	counts, and on-screen alerts.
+</p>
+
+<hr>
+
+<h2>Command Reference</h2>
+
+<h3>General</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>[</kbd> <kbd>A</kbd></td><td>Announce the contents of the "Active Now" section (Friends page)</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>V</kbd></td><td>Report which visible servers have active voice channels or live events</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>B</kbd></td><td>List all buttons for activation (deduplicated, activates the chosen one)</td></tr>
+</table>
+
+<h3>Navigation</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>[</kbd> <kbd>E</kbd></td><td>Move focus to the message input box</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>S</kbd></td><td>Move focus to the server list</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>N</kbd></td><td>Cycle focus among Discord areas (servers → channels → chat → members → user area)</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>U</kbd></td><td>Move focus to the user area</td></tr>
+</table>
+
+<h3>Chat Message Navigation (Home-Row Keys)</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>[</kbd> <kbd>H</kbd></td><td>Jump to the first available message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>J</kbd></td><td>Previous message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>K</kbd></td><td>Read current message (press twice quickly to spell)</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>L</kbd></td><td>Next message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>;</kbd></td><td>Jump to the last available message</td></tr>
+</table>
+
+<h3>Chat Message Navigation (Arrow Keys)</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>[</kbd> <kbd>Home</kbd></td><td>Jump to first message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>Left Arrow</kbd></td><td>Previous message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>Numpad 5</kbd></td><td>Read current message (press twice quickly to spell)</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>Right Arrow</kbd></td><td>Next message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>End</kbd></td><td>Jump to last message</td></tr>
+</table>
+
+<h3>Shift Variants</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>[</kbd> <kbd>Shift+H</kbd> or <kbd>Shift+Home</kbd></td><td>Jump to the "Unread" marker</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>Shift+K</kbd> or <kbd>Shift+Numpad 5</kbd></td><td>Move real focus to the current message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>Shift+P</kbd></td><td>Open pinned messages</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>Shift+T</kbd></td><td>Toggle the thread list</td></tr>
+</table>
+
+<h3>Recent Messages by Number</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>[</kbd> <kbd>1</kbd></td><td>Read the most recent message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>2</kbd> – <kbd>9</kbd></td><td>Read the 2nd through 9th most recent message</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>0</kbd></td><td>Read the 10th most recent message</td></tr>
+</table>
+
+<h3>Voice &amp; Call Management</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>[</kbd> <kbd>D</kbd></td><td>Disconnect from voice / stage channel</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>P</kbd></td><td>Report ping / latency to the Discord server</td></tr>
+</table>
+
+<h3>Information</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>[</kbd> <kbd>T</kbd></td><td>Announce who is typing and slow-mode status</td></tr>
+	<tr><td><kbd>[</kbd> <kbd>W</kbd></td><td>Announce channel info (topic, server name, DM details)</td></tr>
+</table>
+
+<h3>Other Gestures</h3>
+<table>
+	<tr><th>Keys</th><th>Action</th></tr>
+	<tr><td><kbd>NVDA+T</kbd></td><td>Enhanced window title (server, channel, mute/deafen, voice, badges, alerts)</td></tr>
+	<tr><td><kbd>NVDA+Space</kbd></td><td>Toggle browse mode on/off (standard NVDA command)</td></tr>
+</table>
+
+<hr>
+
+<h2>Settings</h2>
+<p>
+	Open <strong>NVDA menu → Preferences → Settings → Discord Enhancements</strong>
+	to configure the add-on.
+</p>
+
+<h3>Command Prefix Key</h3>
+<p>
+	Change the prefix key used to enter the command layer.  The default
+	is <kbd>[</kbd>.  You may use any key or key combination (e.g.
+	<kbd>]</kbd>, <kbd>`</kbd>).  If the chosen key conflicts with an
+	existing NVDA gesture, a warning dialog will appear.
+</p>
+<div class="note">
+	<strong>Important:</strong> If you change the prefix key and then
+	uninstall the add-on, the key binding is automatically reset to the
+	default to prevent orphaned bindings.
+</div>
+
+<h3>Announce Incoming Chat Messages</h3>
+<p>
+	When enabled (default), newly arriving messages in the focused
+	channel are spoken automatically via live-region change events.
+</p>
+
+<h3>Verbosity Level</h3>
+<p>
+	Controls how much detail is reported for various UI elements:
+</p>
+<ul>
+	<li><strong>Minimal (0)</strong> — bare essentials only</li>
+	<li><strong>Normal (1)</strong> — recommended for most users (default)</li>
+	<li><strong>Verbose (2)</strong> — extra details for power users</li>
+	<li><strong>Extra verbose (3)</strong> — maximum detail, useful for debugging</li>
+</ul>
+
+<hr>
+
+<h2>Enhanced Speech Output</h2>
+<p>
+	The add-on automatically enriches the information NVDA speaks for
+	various Discord elements:
+</p>
+<ul>
+	<li><strong>Server list items</strong> — voice activity and live-event indicators appended</li>
+	<li><strong>Channel list items</strong> — voice channel participants with mute/deafen status; "Limited" access notes</li>
+	<li><strong>DM list items</strong> — online status, friend nickname, group member count</li>
+	<li><strong>Members list</strong> — section heading announced (e.g. "Online — 5")</li>
+	<li><strong>Chat messages</strong> — structured reading of author, timestamp, and content</li>
+	<li><strong>Forum posts</strong> — title, tags, pinned status, age, reactions, message count, author</li>
+	<li><strong>Polls</strong> — question, options, vote counts and percentages</li>
+	<li><strong>Inbox items</strong> — reformatted with age prefixes and summaries</li>
+</ul>
+
+<hr>
+
+<h2>Tips and Tricks</h2>
+<ul>
+	<li>
+		<strong>Quickly reach the Friends page:</strong> Press
+		<kbd>Ctrl+1</kbd> twice, then <kbd>[</kbd> <kbd>A</kbd> to
+		hear the Active Now section.
+	</li>
+	<li>
+		<strong>Catch up with unread messages:</strong> Press
+		<kbd>[</kbd> <kbd>Shift+H</kbd> to jump to the unread marker,
+		then use <kbd>[</kbd> <kbd>L</kbd> to read forward.
+	</li>
+	<li>
+		<strong>Discover commands:</strong> Press <kbd>[</kbd> then
+		<kbd>Tab</kbd> repeatedly to explore all available commands.
+	</li>
+	<li>
+		<strong>Spell a message:</strong> Press <kbd>[</kbd> <kbd>K</kbd>
+		twice quickly to spell the current message character by character.
+	</li>
+</ul>
+
+<hr>
+
+<h2>Troubleshooting</h2>
+<ul>
+	<li>
+		<strong>Commands not working:</strong> Make sure focus is on the
+		Discord window and you are not typing in a text field.  The
+		prefix key passes through to Discord when an edit field is focused.
+	</li>
+	<li>
+		<strong>"Element not found" messages:</strong> Discord updates may
+		change the UI structure.  Check the NVDA log (NVDA+F1) for
+		debug warnings about missing elements — these help developers
+		update the add-on's element selectors.
+	</li>
+	<li>
+		<strong>Prefix key types a character instead:</strong> You may
+		be in a text field.  Press <kbd>Escape</kbd> or <kbd>[</kbd>
+		<kbd>E</kbd> to leave the text field first.
+	</li>
+</ul>
+
+<hr>
+
+<h2>Known Limitations</h2>
+<ul>
+	<li>Block quotes and code blocks are not specially indicated.</li>
+	<li>Bullet points and numbered lists in messages may not be announced (use browse mode for full access).</li>
+	<li>Braille output enhancements are not yet implemented.</li>
+	<li>Some features depend on Discord's accessibility tree structure, which may change between versions.</li>
+</ul>
+
+<hr>
+
+<h2>Acknowledgements</h2>
+<p>
+	This add-on is inspired by
+	<a href="https://dlee.org/discord">Doug Lee's JAWS scripts for Discord</a>.
+	Thanks to the NVDA community for the screen reader and add-on framework.
+</p>
+
+</body>
+</html>
