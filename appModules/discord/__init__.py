@@ -401,12 +401,8 @@ class AppModule(appModuleHandler.AppModule):
 			if not self._isPrefixGesture(gesture):
 				return True  # Not our key, pass through
 
-			# If focus is in an edit field, let the key type normally
-			focus = api.getFocusObject()
-			if _isEditField(focus):
-				return True
-
-			# Enter the command layer
+			# Enter the command layer (works everywhere, even in
+			# edit fields -- press the prefix key twice to type it)
 			self._enterCommandLayer()
 			return False  # Swallow the prefix key
 		except Exception:
@@ -491,9 +487,14 @@ class AppModule(appModuleHandler.AppModule):
 			self._exitCommandLayer()
 			return
 
-		# --- Prefix key again: just cancel the layer ---
+		# --- Prefix key again: type the literal prefix character ---
 		if self._isPrefixGesture(gesture):
 			self._exitCommandLayer()
+			# Send the actual keystroke so it types in edit fields
+			try:
+				gesture.send()
+			except Exception:
+				pass
 			return
 
 		# --- Tab / Shift+Tab: explore commands ---
