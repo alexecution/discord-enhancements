@@ -1518,31 +1518,120 @@ def find_unread_marker(message_list=None):
 
 
 def get_all_buttons(root=None):
-	"""Get all named buttons. Uses cache for depth-1 buttons."""
+	"""Get all named buttons using role-based detection.
+
+	Searches depth-1, depth-2, and does a full BFS from the content
+	root to find ALL buttons (including deeply nested ones like
+	Watch Stream in voice channels).
+
+	For 'Watch Stream' buttons, enriches the label with the streamer's
+	username extracted from adjacent 'Call tile, stream, USERNAME'
+	siblings or parent list items.
+
+	Returns a list of (display_name, obj) tuples.
+	"""
+	import re
+
 	seen = set()
 	buttons = []
 
-	# Fast: depth-1 buttons from cache
-	for name, child in _get_depth1():
-		if name and name not in seen:
-			# Check class name for buttons (avoids safe_role COM call)
-			cls_name = type(child).__name__
-			if "Button" in cls_name or "Toggle" in cls_name or "Split" in cls_name:
-				seen.add(name)
-				buttons.append((name, child))
+	def _is_button(obj):
+		role = safe_role(obj)
+		return role in (
+			controlTypes.Role.BUTTON,
+			controlTypes.Role.TOGGLEBUTTON,
+			controlTypes.Role.SPLITBUTTON,
+			controlTypes.Role.MENUBUTTON,
+		)
 
-	# Also check inside server landmark
-	server = _d1_find_landmark("(server)")
-	if server:
-		for child in _iter_children(server):
-			cls_name = type(child).__name__
-			if "Button" in cls_name or "Toggle" in cls_name or "Split" in cls_name:
-				name = safe_name(child)
-				if name and name not in seen:
-					seen.add(name)
-					buttons.append((name, child))
-					if len(buttons) >= 50:
-						break
+	def _get_streamer_name(btn_obj):
+		"""Find the streamer's name for a Watch Stream button.
+
+		Discord's voice channel structure puts a 'Call tile, stream,
+		USERNAME' button as the previous sibling of 'Watch Stream'.
+		Also checks parent chain for LISTITEM/TREEVIEWITEM names.
+		"""
+		# Strategy 1: check previous siblings for "Call tile, stream, ..."
+		try:
+			sib = btn_obj.simplePrevious
+			for _ in range(3):
+				if not sib:
+					break
+				name = safe_name(sib)
+				if name:
+					lower = name.lower()
+					# "Call tile, stream, blueotokomidori"
+					if "call tile" in lower and "stream" in lower:
+						parts = name.split(",")
+						if len(parts) >= 3:
+							return parts[-1].strip()
+					# "Call tile, USERNAME" (without stream)
+					elif "call tile" in lower:
+						parts = name.split(",")
+						if len(parts) >= 2:
+							return parts[-1].strip()
+				sib = sib.simplePrevious
+		except (COMError, Exception):
+			pass
+
+		# Strategy 2: walk up parent chain
+		try:
+			obj = btn_obj
+			for _ in range(5):
+				obj = obj.parent
+				if not obj:
+					break
+				name = safe_name(obj)
+				role = safe_role(obj)
+				if name and role in (
+					controlTypes.Role.LISTITEM,
+					controlTypes.Role.TREEVIEWITEM,
+					controlTypes.Role.GROUPING,
+				):
+					return name
+		except (COMError, Exception):
+			pass
+
+		return None
+
+	def _add_button(obj):
+		name = safe_name(obj)
+		if not name:
+			return
+		display_name = name
+		lower = name.lower().strip()
+		# Enrich "Watch Stream" buttons with the streamer's name
+		if lower in ("watch stream", "watch", "view stream"):
+			username = _get_streamer_name(obj)
+			if username:
+				display_name = "%s (%s)" % (name, username)
+		if display_name not in seen:
+			seen.add(display_name)
+			buttons.append((display_name, obj))
+
+	# --- Pass 1: depth-1 cache (instant) ---
+	for d1_name, child in _get_depth1():
+		if d1_name and _is_button(child):
+			_add_button(child)
+
+	# --- Pass 2: depth-2 cache (instant) ---
+	for gc_name, gc_child, _parent in _get_depth2():
+		if gc_name and _is_button(gc_child):
+			_add_button(gc_child)
+
+	# --- Pass 3: full BFS via walk_descendants ---
+	# Uses the same proven approach as dump_tree (which DOES find
+	# Watch Stream).  walk_descendants has a 10-second timeout and
+	# max depth of 10, which is sufficient for Discord's deep tree.
+	# The previous multi-pass approach with 3-5 second timeouts
+	# timed out before reaching deeply nested voice channel buttons.
+	content_root = root or get_content_root()
+	if content_root:
+		for obj in walk_descendants(content_root):
+			if _is_button(obj):
+				_add_button(obj)
+				if len(buttons) >= 200:
+					break
 
 	return buttons
 
