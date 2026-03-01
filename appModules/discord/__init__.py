@@ -24,6 +24,7 @@
 #   - _discordCaptor -- O(1), just key comparisons
 #   - Tree walking ONLY happens inside explicit command handlers
 
+import threading
 import time
 from comtypes import COMError
 from logHandler import log
@@ -41,6 +42,18 @@ from . import uia
 
 
 # ---------------------------------------------------------------------------
+# Tone constants (frequency Hz, duration ms)
+# ---------------------------------------------------------------------------
+_TONE_ENTER = (800, 25)     # layer entered
+_TONE_EXIT = (400, 25)      # layer exited / command executed
+_TONE_WRAP = (200, 40)      # Tab exploration wrapped around
+_TONE_ERROR = (150, 60)     # unknown key / error
+
+# Seconds before announcing "Working, please wait" for slow commands
+_SLOW_COMMAND_THRESHOLD = 3.0
+
+
+# ---------------------------------------------------------------------------
 # Thread-safe command execution
 # ---------------------------------------------------------------------------
 # _captureFunc runs on NVDA's keyboard hook thread.  UIA COM calls and
@@ -48,8 +61,23 @@ from . import uia
 # the handler via wx.CallAfter.
 
 def _run_on_main(handler):
-	"""Execute *handler* on the main wx GUI thread."""
+	"""Execute *handler* on the main wx GUI thread.
+
+	If the handler takes longer than _SLOW_COMMAND_THRESHOLD seconds,
+	a 'Working, please wait' message is spoken so the user knows the
+	command is still processing.
+	"""
 	import wx
+
+	completed = threading.Event()
+
+	def _announce_waiting():
+		if not completed.is_set():
+			ui.message("Working, please wait")
+
+	timer = threading.Timer(_SLOW_COMMAND_THRESHOLD, _announce_waiting)
+	timer.daemon = True
+	timer.start()
 
 	def _do():
 		try:
@@ -57,17 +85,11 @@ def _run_on_main(handler):
 		except Exception:
 			log.error("Command handler error", exc_info=True)
 			tones.beep(*_TONE_ERROR)
+		finally:
+			completed.set()
+			timer.cancel()
 
 	wx.CallAfter(_do)
-
-
-# ---------------------------------------------------------------------------
-# Tone constants (frequency Hz, duration ms)
-# ---------------------------------------------------------------------------
-_TONE_ENTER = (800, 25)     # layer entered
-_TONE_EXIT = (400, 25)      # layer exited / command executed
-_TONE_WRAP = (200, 40)      # Tab exploration wrapped around
-_TONE_ERROR = (150, 60)     # unknown key / error
 
 
 # ---------------------------------------------------------------------------
