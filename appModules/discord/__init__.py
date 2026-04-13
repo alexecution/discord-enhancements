@@ -477,7 +477,8 @@ class AppModule(appModuleHandler.AppModule):
 		try:
 			name = self._getLatestMessageViaUIA()
 			self._lastUiaRead = time.time()
-			if name:
+			if name and name != self._lastPollText:
+				self._lastPollText = name
 				self._filterAndAnnounce(name)
 		except Exception as e:
 			log.warning("Discord Enhancements: uiaRead error: %s" % e)
