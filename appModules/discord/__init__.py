@@ -24,7 +24,10 @@
 #   - _discordCaptor -- O(1), just key comparisons
 #   - Tree walking ONLY happens inside explicit command handlers
 
-import threading
+import contextlib
+import ctypes
+import ctypes.wintypes
+import re
 import time
 from comtypes import COMError
 from logHandler import log
@@ -32,7 +35,9 @@ import appModuleHandler
 import api
 import config
 import controlTypes
+import core
 import inputCore
+import speech
 import tones
 import ui
 
@@ -49,47 +54,57 @@ _TONE_EXIT = (400, 25)      # layer exited / command executed
 _TONE_WRAP = (200, 40)      # Tab exploration wrapped around
 _TONE_ERROR = (150, 60)     # unknown key / error
 
-# Seconds before announcing "Working, please wait" for slow commands
-_SLOW_COMMAND_THRESHOLD = 3.0
+
+# ---------------------------------------------------------------------------
+# UIA polling constants
+# ---------------------------------------------------------------------------
+_POLL_INTERVAL_MS = 500  # milliseconds between UIA polls
+
+# WinEvent constants for IAccessible fast-path hook
+EVENT_OBJECT_NAMECHANGE = 0x800C
+WINEVENT_OUTOFCONTEXT = 0x0000
+_WinEventProcType = ctypes.WINFUNCTYPE(
+	None,
+	ctypes.wintypes.HANDLE,
+	ctypes.wintypes.DWORD,
+	ctypes.wintypes.HWND,
+	ctypes.wintypes.LONG,
+	ctypes.wintypes.LONG,
+	ctypes.wintypes.DWORD,
+	ctypes.wintypes.DWORD,
+)
+
+# UIA property/type constants
+_UIA_NamePropertyId = 30005
+_UIA_ControlTypePropertyId = 30003
+_UIA_ListControlTypeId = 50008
+_UIA_TreeScope_Descendants = 4
+
+# Filtering: status suffixes to ignore in announcements
+_STATUS_SUFFIXES_LOWER = (
+	', online', ', offline', ', idle',
+	', do not disturb', ', streaming',
+)
+# Standalone timestamp pattern like "9:04 AM"
+_TIMESTAMP_RE = re.compile(r'^\d{1,2}:\d{2}\s*(AM|PM)?$', re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
 # Thread-safe command execution
 # ---------------------------------------------------------------------------
-# _captureFunc runs on NVDA's keyboard hook thread.  UIA COM calls and
-# wx dialogs must happen on the main GUI thread.  This helper schedules
-# the handler via wx.CallAfter.
+# _captureFunc runs on NVDA's keyboard hook thread.  UIA COM calls
+# must happen on the main thread.  core.callLater posts directly to
+# NVDA's main loop which is faster than wx.CallAfter.
 
 def _run_on_main(handler):
-	"""Execute *handler* on the main wx GUI thread.
-
-	If the handler takes longer than _SLOW_COMMAND_THRESHOLD seconds,
-	a 'Working, please wait' message is spoken so the user knows the
-	command is still processing.
-	"""
-	import wx
-
-	completed = threading.Event()
-
-	def _announce_waiting():
-		if not completed.is_set():
-			ui.message("Working, please wait")
-
-	timer = threading.Timer(_SLOW_COMMAND_THRESHOLD, _announce_waiting)
-	timer.daemon = True
-	timer.start()
-
+	"""Execute *handler* on the main NVDA thread via core.callLater."""
 	def _do():
 		try:
 			handler()
 		except Exception:
 			log.error("Command handler error", exc_info=True)
 			tones.beep(*_TONE_ERROR)
-		finally:
-			completed.set()
-			timer.cancel()
-
-	wx.CallAfter(_do)
+	core.callLater(0, _do)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +143,7 @@ COMMAND_REGISTRY = [
 	("shift+numpad5",   commands.cmd_focusCurrentMessage, "Focus current message"),
 	("shift+p",         commands.cmd_pinnedMessages,      "Open pinned messages"),
 	("shift+t",         commands.cmd_threadList,           "Toggle thread list"),
+	("shift+d",         commands.cmd_toggleAnnounce,       "Toggle message announcements"),
 	# --- Voice ---
 	("d",       commands.cmd_disconnect,       "Disconnect from voice"),
 	("p",       commands.cmd_ping,             "Report ping / latency"),
@@ -218,9 +234,46 @@ class AppModule(appModuleHandler.AppModule):
 		self._layerStartTime = 0.0
 		self._exploreIndex = -1
 		self._lastExplored = None
+
+		# UIA polling state
+		self._pollTimer = None
+		self._lastPollText = ""
+		self._cachedMsgList = None
+		self._cachedMsgListName = None
+		self._discordHwnd = 0
+		self._terminated = False
+		self._lastHookTime = 0.0
+		self._lastUiaRead = 0.0
+
+		# WinEvent hook — fast-path trigger for immediate UIA reads
+		self._hookProc = _WinEventProcType(self._winEventCallback)
+		self._hook = ctypes.windll.user32.SetWinEventHook(
+			EVENT_OBJECT_NAMECHANGE,
+			EVENT_OBJECT_NAMECHANGE,
+			None,
+			self._hookProc,
+			self.processID,
+			0,
+			WINEVENT_OUTOFCONTEXT,
+		)
+		if self._hook:
+			log.info("Discord Enhancements: WinEvent hook registered")
+		else:
+			log.warning("Discord Enhancements: WinEvent hook failed")
+
+		# Start UIA polling — primary message detection mechanism
+		self._schedulePoll()
 		log.info("Discord Enhancements appModule loaded")
 
 	def terminate(self):
+		self._terminated = True
+		if self._pollTimer is not None:
+			with contextlib.suppress(Exception):
+				self._pollTimer.Stop()
+			self._pollTimer = None
+		if getattr(self, '_hook', None):
+			ctypes.windll.user32.UnhookWinEvent(self._hook)
+			self._hook = None
 		if inputCore.manager._captureFunc == self._discordCaptor:
 			inputCore.manager._captureFunc = None
 		self._layerActive = False
@@ -332,6 +385,16 @@ class AppModule(appModuleHandler.AppModule):
 
 	__gestures = {
 		"kb:NVDA+t": "title",
+		"kb:alt+1": "readMessage1",
+		"kb:alt+2": "readMessage2",
+		"kb:alt+3": "readMessage3",
+		"kb:alt+4": "readMessage4",
+		"kb:alt+5": "readMessage5",
+		"kb:alt+6": "readMessage6",
+		"kb:alt+7": "readMessage7",
+		"kb:alt+8": "readMessage8",
+		"kb:alt+9": "readMessage9",
+		"kb:alt+0": "readMessage10",
 	}
 
 	# ------------------------------------------------------------------
@@ -349,11 +412,12 @@ class AppModule(appModuleHandler.AppModule):
 			clsList.insert(0, overlay)
 
 	# ------------------------------------------------------------------
-	# Incoming message announcements (passive event handlers)
+	# Incoming message announcements
 	# ------------------------------------------------------------------
-	# These handlers are called BY NVDA when it detects live-region or
-	# alert events.  Zero cost when no events fire.  No polling, no
-	# timers, no hooks -- purely reactive.
+	# Hybrid approach: UIA polling every 500ms as the primary mechanism
+	# (reliable for Chromium/Electron), plus reactive event handlers
+	# as a fast-path for immediate detection.  Both paths funnel
+	# through _filterAndAnnounce for deduplication and filtering.
 
 	_lastAnnouncedText = ""
 	_lastAnnouncedTime = 0.0
@@ -364,16 +428,348 @@ class AppModule(appModuleHandler.AppModule):
 		except (KeyError, Exception):
 			return True
 
-	def _announceIfNew(self, text):
-		"""Speak text if it's not a duplicate of the last announcement."""
-		if not text:
+	# ------------------------------------------------------------------
+	# WinEvent hook — fast-path trigger for message detection
+	# ------------------------------------------------------------------
+
+	def _winEventCallback(self, hHook, event, hwnd, idObject, idChild, thread, time_ms):
+		"""IAccessible nameChange hook — triggers an immediate UIA read."""
+		try:
+			if not self._discordHwnd and hwnd:
+				self._discordHwnd = hwnd
+			self._lastHookTime = time.time()
+			# Debounce: skip if a UIA read ran within the last poll interval
+			if time.time() - self._lastUiaRead < _POLL_INTERVAL_MS / 1000.0:
+				return
+			core.callLater(0, self._uiaReadLatest)
+		except Exception:
+			pass
+
+	# ------------------------------------------------------------------
+	# UIA polling — primary message detection
+	# ------------------------------------------------------------------
+
+	def _schedulePoll(self):
+		"""Schedule the next UIA poll via core.callLater."""
+		if not self._terminated:
+			self._pollTimer = core.callLater(_POLL_INTERVAL_MS, self._pollTick)
+
+	def _pollTick(self):
+		"""Run a UIA read and reschedule."""
+		self._pollTimer = None
+		if self._terminated:
 			return
+		self._uiaReadLatest()
+		self._schedulePoll()
+
+	def _uiaReadLatest(self):
+		"""Read the latest message from Discord's UIA tree; announce if new."""
+		if self._terminated:
+			return
+		if not self._shouldAnnounce():
+			return
+		try:
+			fg = api.getForegroundObject()
+			if not fg or fg.appModule is not self:
+				return
+		except Exception:
+			return
+		try:
+			name = self._getLatestMessageViaUIA()
+			self._lastUiaRead = time.time()
+			if name:
+				self._filterAndAnnounce(name)
+		except Exception as e:
+			log.warning("Discord Enhancements: uiaRead error: %s" % e)
+
+	def _getMsgListViaUIA(self, uia_client):
+		"""Find and cache the Discord message list UIA element.
+
+		On a cache hit the expensive FindAll tree walk is skipped.
+		The cache is invalidated when the element's name changes
+		(channel switch) or when accessing it raises a COM exception.
+		"""
+		if self._cachedMsgList:
+			cache_valid = False
+			with contextlib.suppress(Exception):
+				n = self._cachedMsgList.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
+				cache_valid = bool(n and n == self._cachedMsgListName)
+			if cache_valid:
+				return self._cachedMsgList
+			self._cachedMsgList = None
+			self._cachedMsgListName = None
+
+		hwnd = self._discordHwnd
+		if not hwnd:
+			try:
+				fg = api.getForegroundObject()
+				if fg and fg.appModule is self:
+					hwnd = fg.windowHandle
+					self._discordHwnd = hwnd
+			except Exception:
+				pass
+		if not hwnd:
+			return None
+
+		try:
+			root = uia_client.ElementFromHandle(hwnd)
+		except Exception:
+			return None
+		if not root:
+			return None
+
+		condition = uia_client.CreatePropertyCondition(
+			_UIA_ControlTypePropertyId, _UIA_ListControlTypeId
+		)
+		lists = root.FindAll(_UIA_TreeScope_Descendants, condition)
+		if not lists or lists.Length == 0:
+			return None
+
+		for i in range(lists.Length):
+			elem = lists.GetElement(i)
+			n = elem.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
+			if "messages in" in n.lower():
+				self._cachedMsgList = elem
+				self._cachedMsgListName = n
+				return elem
+		return None
+
+	def _getLatestMessageViaUIA(self):
+		"""Walk Discord's UIA tree and return text of the latest message."""
+		try:
+			import UIAHandler
+			uia_client = UIAHandler.handler.clientObject
+			if not uia_client:
+				return None
+
+			msgList = self._getMsgListViaUIA(uia_client)
+			if not msgList:
+				return None
+
+			walker = uia_client.RawViewWalker
+			child = walker.GetLastChildElement(msgList)
+
+			# If cached element is detached, retry
+			if not child and self._cachedMsgList is not None:
+				self._cachedMsgList = None
+				self._cachedMsgListName = None
+				msgList = self._getMsgListViaUIA(uia_client)
+				if not msgList:
+					return None
+				child = walker.GetLastChildElement(msgList)
+
+			# Walk backward from last child to find a named element
+			for _ in range(10):
+				if not child:
+					break
+				name = child.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
+				if name:
+					return name
+				# Check grandchildren
+				grandchild = walker.GetLastChildElement(child)
+				while grandchild:
+					gname = grandchild.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
+					if gname:
+						return gname
+					grandchild = walker.GetPreviousSiblingElement(grandchild)
+				child = walker.GetPreviousSiblingElement(child)
+
+			return None
+		except Exception as e:
+			log.warning("Discord Enhancements: getLatestMessage error: %s" % e)
+			return None
+
+	def _getMessagesViaUIA(self, count=10):
+		"""Walk the UIA tree and return up to *count* recent messages (oldest first)."""
+		try:
+			import UIAHandler
+			uia_client = UIAHandler.handler.clientObject
+			if not uia_client:
+				return []
+
+			msgList = self._getMsgListViaUIA(uia_client)
+			if not msgList:
+				return []
+
+			walker = uia_client.RawViewWalker
+			child = walker.GetLastChildElement(msgList)
+
+			if not child and self._cachedMsgList is not None:
+				self._cachedMsgList = None
+				self._cachedMsgListName = None
+				msgList = self._getMsgListViaUIA(uia_client)
+				if not msgList:
+					return []
+				child = walker.GetLastChildElement(msgList)
+
+			candidates = []
+			limit = count * 4
+			iterations = 0
+			while child and iterations < limit:
+				iterations += 1
+				name = child.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
+				if name:
+					candidates.append(name)
+				else:
+					grandchild = walker.GetLastChildElement(child)
+					while grandchild:
+						gname = grandchild.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
+						if gname:
+							candidates.append(gname)
+							break
+						grandchild = walker.GetPreviousSiblingElement(grandchild)
+				child = walker.GetPreviousSiblingElement(child)
+
+			messages = [m for m in candidates if self._isValidMessage(m)]
+			messages = messages[:count]
+			messages.reverse()  # oldest first
+			return messages
+		except Exception as e:
+			log.warning("Discord Enhancements: getMessages error: %s" % e)
+			return []
+
+	# ------------------------------------------------------------------
+	# Filtering and announcement
+	# ------------------------------------------------------------------
+
+	def _isValidMessage(self, name):
+		"""Return True if *name* looks like a real chat message."""
+		lower = name.lower()
+		if any(lower.endswith(s) for s in _STATUS_SUFFIXES_LOWER):
+			return False
+		if 'is typing' in lower or 'are typing' in lower:
+			return False
+		if ' , ' in name:
+			parts = name.split(' , ')
+			if ':' not in parts[-1]:
+				return False
+			body = ' , '.join(parts[1:-1]).strip() if len(parts) >= 3 else ""
+			return bool(body)
+		return len(name) >= 3 and not _TIMESTAMP_RE.match(name.strip())
+
+	def _filterAndAnnounce(self, name):
+		"""Filter out non-message text and announce if new."""
+		lower = name.lower()
+
+		if any(lower.endswith(s) for s in _STATUS_SUFFIXES_LOWER):
+			return
+		if 'is typing' in lower or 'are typing' in lower:
+			return
+
+		if ' , ' in name:
+			# IAccessible format: "username , body , HH:MM AM"
+			parts = name.split(' , ')
+			if ':' not in parts[-1]:
+				return
+			body = ' , '.join(parts[1:-1]).strip() if len(parts) >= 3 else ""
+			if not body:
+				return
+			self._scheduleAnnounce(name)
+			return
+
+		# Plain-text UIA — skip timestamps and very short UI labels
+		if len(name) < 3 or _TIMESTAMP_RE.match(name.strip()):
+			return
+		self._scheduleAnnounce(name)
+
+	def _scheduleAnnounce(self, text):
+		"""Announce *text* if it differs from the last announced text."""
 		now = time.time()
 		if text == self._lastAnnouncedText and now - self._lastAnnouncedTime < 1.0:
 			return
+		if not self._shouldAnnounce():
+			return
 		self._lastAnnouncedText = text
 		self._lastAnnouncedTime = now
-		ui.message(text)
+		self._lastPollText = text
+		self._doAnnounce(text)
+
+	def _doAnnounce(self, text):
+		"""Format and speak the message text at highest priority."""
+		# IAccessible format → "username: body"
+		if ' , ' in text:
+			parts = text.split(' , ')
+			formatted = (
+				"%s: %s" % (parts[0], ' , '.join(parts[1:-1]))
+				if len(parts) >= 3
+				else parts[0]
+			)
+		else:
+			formatted = text
+		try:
+			speech.speak([formatted], priority=speech.Spri.NOW)
+		except Exception as e:
+			log.warning("Discord Enhancements: speech error: %s" % e)
+
+	# ------------------------------------------------------------------
+	# History reading via raw UIA (Alt+1 through Alt+0)
+	# ------------------------------------------------------------------
+
+	def _readNthLastMessage(self, n):
+		"""Speak the Nth-last message (1 = most recent)."""
+		try:
+			fg = api.getForegroundObject()
+			if not fg or fg.appModule is not self:
+				return
+		except Exception:
+			return
+		messages = self._getMessagesViaUIA(count=10)
+		if not messages:
+			ui.message("No messages found")
+			return
+		idx = len(messages) - n
+		if idx < 0:
+			ui.message("Message %d not available" % n)
+			return
+		self._doAnnounce(messages[idx])
+
+	def script_readMessage1(self, gesture):
+		"""Read the most recent message."""
+		self._readNthLastMessage(1)
+
+	def script_readMessage2(self, gesture):
+		"""Read the 2nd most recent message."""
+		self._readNthLastMessage(2)
+
+	def script_readMessage3(self, gesture):
+		"""Read the 3rd most recent message."""
+		self._readNthLastMessage(3)
+
+	def script_readMessage4(self, gesture):
+		"""Read the 4th most recent message."""
+		self._readNthLastMessage(4)
+
+	def script_readMessage5(self, gesture):
+		"""Read the 5th most recent message."""
+		self._readNthLastMessage(5)
+
+	def script_readMessage6(self, gesture):
+		"""Read the 6th most recent message."""
+		self._readNthLastMessage(6)
+
+	def script_readMessage7(self, gesture):
+		"""Read the 7th most recent message."""
+		self._readNthLastMessage(7)
+
+	def script_readMessage8(self, gesture):
+		"""Read the 8th most recent message."""
+		self._readNthLastMessage(8)
+
+	def script_readMessage9(self, gesture):
+		"""Read the 9th most recent message."""
+		self._readNthLastMessage(9)
+
+	def script_readMessage10(self, gesture):
+		"""Read the 10th most recent message."""
+		self._readNthLastMessage(10)
+
+	# ------------------------------------------------------------------
+	# Toggle announcement
+	# ------------------------------------------------------------------
+
+	# ------------------------------------------------------------------
+	# Reactive event handlers (fast-path, supplement polling)
+	# ------------------------------------------------------------------
 
 	def event_liveRegionChange(self, obj, nextHandler):
 		"""Announce live-region updates (incoming chat messages)."""
@@ -382,9 +778,7 @@ class AppModule(appModuleHandler.AppModule):
 			if not text:
 				text = uia.read_message_content(obj)
 			if text and text != "(empty message)":
-				lower = text.lower()
-				if "typing" not in lower:
-					self._announceIfNew(text)
+				self._filterAndAnnounce(text)
 		nextHandler()
 
 	def event_alert(self, obj, nextHandler):
@@ -392,7 +786,13 @@ class AppModule(appModuleHandler.AppModule):
 		if self._shouldAnnounce():
 			text = uia.safe_name(obj) or uia.safe_value(obj) or ""
 			if text:
-				self._announceIfNew(text)
+				self._filterAndAnnounce(text)
+		nextHandler()
+
+	def event_valueChange(self, obj, nextHandler):
+		"""Suppress Discord's edit-field clearing from cancelling announcement."""
+		if time.time() - self._lastHookTime < 2.0:
+			return
 		nextHandler()
 
 	# ------------------------------------------------------------------

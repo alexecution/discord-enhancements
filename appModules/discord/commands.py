@@ -387,6 +387,18 @@ def cmd_ping():
 # Chat information commands
 # ---------------------------------------------------------------------------
 
+def cmd_toggleAnnounce():
+	"""[ Shift+D — Toggle automatic incoming message announcements."""
+	import config
+	try:
+		current = config.conf["discordAddon"]["announceChatMessages"]
+		config.conf["discordAddon"]["announceChatMessages"] = not current
+		state = "off" if current else "on"
+	except (KeyError, Exception):
+		state = "toggled"
+	ui.message("Discord message announcements %s" % state)
+
+
 def cmd_typing():
 	"""[ T — Announce who is typing and slow-mode status."""
 	indicator = uia.find_typing_indicator()
