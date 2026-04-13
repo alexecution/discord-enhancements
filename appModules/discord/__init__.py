@@ -24,10 +24,12 @@
 #   - _discordCaptor -- O(1), just key comparisons
 #   - Tree walking ONLY happens inside explicit command handlers
 
+import comtypes
 import contextlib
 import ctypes
 import ctypes.wintypes
 import re
+import threading
 import time
 from comtypes import COMError
 from logHandler import log
@@ -235,8 +237,8 @@ class AppModule(appModuleHandler.AppModule):
 		self._exploreIndex = -1
 		self._lastExplored = None
 
-		# UIA polling state
-		self._pollTimer = None
+		# UIA polling state (background thread owns the poll loop;
+		# main-thread Alt+N shortcuts use these for their own cache)
 		self._lastPollText = ""
 		self._cachedMsgList = None
 		self._cachedMsgListName = None
@@ -261,16 +263,19 @@ class AppModule(appModuleHandler.AppModule):
 		else:
 			log.warning("Discord Enhancements: WinEvent hook failed")
 
-		# Start UIA polling — primary message detection mechanism
-		self._schedulePoll()
+		# Background polling thread — UIA reads happen off the main
+		# thread so they never block keyboard/speech processing.
+		self._pollWakeEvent = threading.Event()
+		self._pollThread = threading.Thread(
+			target=self._pollLoop, daemon=True, name="DiscordUiaPoll")
+		self._pollThread.start()
 		log.info("Discord Enhancements appModule loaded")
 
 	def terminate(self):
 		self._terminated = True
-		if self._pollTimer is not None:
-			with contextlib.suppress(Exception):
-				self._pollTimer.Stop()
-			self._pollTimer = None
+		self._pollWakeEvent.set()  # wake thread so it exits
+		if self._pollThread:
+			self._pollThread.join(timeout=2.0)
 		if getattr(self, '_hook', None):
 			ctypes.windll.user32.UnhookWinEvent(self._hook)
 			self._hook = None
@@ -433,7 +438,7 @@ class AppModule(appModuleHandler.AppModule):
 	# ------------------------------------------------------------------
 
 	def _winEventCallback(self, hHook, event, hwnd, idObject, idChild, thread, time_ms):
-		"""IAccessible nameChange hook — triggers an immediate UIA read."""
+		"""IAccessible nameChange hook — wakes the poll thread for an immediate read."""
 		try:
 			if not self._discordHwnd and hwnd:
 				self._discordHwnd = hwnd
@@ -441,59 +446,170 @@ class AppModule(appModuleHandler.AppModule):
 			# Debounce: skip if a UIA read ran within the last poll interval
 			if time.time() - self._lastUiaRead < _POLL_INTERVAL_MS / 1000.0:
 				return
-			core.callLater(0, self._uiaReadLatest)
+			self._pollWakeEvent.set()
 		except Exception:
 			pass
 
 	# ------------------------------------------------------------------
-	# UIA polling — primary message detection
+	# UIA polling — background thread
+	# ------------------------------------------------------------------
+	# All UIA COM calls for polling happen on a daemon thread with its
+	# own COM client.  Only the final speech call is posted back to
+	# NVDA's main thread via core.callLater.
+
+	def _pollLoop(self):
+		"""Background thread: poll Discord's UIA tree for new messages."""
+		comtypes.CoInitialize()
+		uia_client = None
+		cached_msg_list = None
+		cached_msg_list_name = None
+
+		try:
+			while not self._terminated:
+				# Sleep up to 500ms, but wake early on WinEvent signal
+				self._pollWakeEvent.wait(_POLL_INTERVAL_MS / 1000.0)
+				self._pollWakeEvent.clear()
+				if self._terminated:
+					break
+				if not self._shouldAnnounce():
+					continue
+
+				# Check foreground via pure Win32 (no NVDA API needed)
+				try:
+					fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+					pid = ctypes.wintypes.DWORD()
+					ctypes.windll.user32.GetWindowThreadProcessId(
+						fg_hwnd, ctypes.byref(pid))
+					if pid.value != self.processID:
+						continue
+				except Exception:
+					continue
+
+				# Store hwnd for main-thread Alt+N usage too
+				if fg_hwnd and not self._discordHwnd:
+					self._discordHwnd = fg_hwnd
+
+				# Lazy-init UIA client on this thread
+				if uia_client is None:
+					try:
+						from comInterfaces import UIAutomationClient as UIA
+						try:
+							uia_client = comtypes.CoCreateInstance(
+								UIA.CUIAutomation8._reg_clsid_,
+								interface=UIA.IUIAutomation,
+							)
+						except Exception:
+							uia_client = comtypes.CoCreateInstance(
+								UIA.CUIAutomation._reg_clsid_,
+								interface=UIA.IUIAutomation,
+							)
+					except Exception:
+						continue
+
+				# Validate message list cache
+				if cached_msg_list:
+					try:
+						n = cached_msg_list.GetCurrentPropertyValue(
+							_UIA_NamePropertyId) or ""
+						if not (n and n == cached_msg_list_name):
+							cached_msg_list = None
+							cached_msg_list_name = None
+					except Exception:
+						cached_msg_list = None
+						cached_msg_list_name = None
+
+				# Find message list if not cached
+				if not cached_msg_list:
+					try:
+						root = uia_client.ElementFromHandle(fg_hwnd)
+						if not root:
+							continue
+						condition = uia_client.CreatePropertyCondition(
+							_UIA_ControlTypePropertyId,
+							_UIA_ListControlTypeId,
+						)
+						lists = root.FindAll(
+							_UIA_TreeScope_Descendants, condition)
+						if not lists or lists.Length == 0:
+							continue
+						found = False
+						for i in range(lists.Length):
+							elem = lists.GetElement(i)
+							n = elem.GetCurrentPropertyValue(
+								_UIA_NamePropertyId) or ""
+							if "messages in" in n.lower():
+								cached_msg_list = elem
+								cached_msg_list_name = n
+								found = True
+								break
+						if not found:
+							continue
+					except Exception:
+						continue
+
+				# Read the latest message
+				try:
+					walker = uia_client.RawViewWalker
+					child = walker.GetLastChildElement(cached_msg_list)
+
+					if not child:
+						# Cache may be stale
+						cached_msg_list = None
+						cached_msg_list_name = None
+						continue
+
+					name = None
+					for _ in range(10):
+						if not child:
+							break
+						n = child.GetCurrentPropertyValue(
+							_UIA_NamePropertyId) or ""
+						if n:
+							name = n
+							break
+						gchild = walker.GetLastChildElement(child)
+						while gchild:
+							gn = gchild.GetCurrentPropertyValue(
+								_UIA_NamePropertyId) or ""
+							if gn:
+								name = gn
+								break
+							gchild = walker.GetPreviousSiblingElement(
+								gchild)
+						if name:
+							break
+						child = walker.GetPreviousSiblingElement(child)
+
+					self._lastUiaRead = time.time()
+					if name and name != self._lastPollText:
+						self._lastPollText = name
+						core.callLater(0, self._filterAndAnnounce, name)
+
+				except Exception:
+					cached_msg_list = None
+					cached_msg_list_name = None
+
+		except Exception:
+			log.error("Discord poll loop crashed", exc_info=True)
+		finally:
+			with contextlib.suppress(Exception):
+				comtypes.CoUninitialize()
+
+	# ------------------------------------------------------------------
+	# Main-thread UIA helpers (for Alt+N history reading)
 	# ------------------------------------------------------------------
 
-	def _schedulePoll(self):
-		"""Schedule the next UIA poll via core.callLater."""
-		if not self._terminated:
-			self._pollTimer = core.callLater(_POLL_INTERVAL_MS, self._pollTick)
-
-	def _pollTick(self):
-		"""Run a UIA read and reschedule."""
-		self._pollTimer = None
-		if self._terminated:
-			return
-		self._uiaReadLatest()
-		self._schedulePoll()
-
-	def _uiaReadLatest(self):
-		"""Read the latest message from Discord's UIA tree; announce if new."""
-		if self._terminated:
-			return
-		if not self._shouldAnnounce():
-			return
-		try:
-			fg = api.getForegroundObject()
-			if not fg or fg.appModule is not self:
-				return
-		except Exception:
-			return
-		try:
-			name = self._getLatestMessageViaUIA()
-			self._lastUiaRead = time.time()
-			if name and name != self._lastPollText:
-				self._lastPollText = name
-				self._filterAndAnnounce(name)
-		except Exception as e:
-			log.warning("Discord Enhancements: uiaRead error: %s" % e)
-
 	def _getMsgListViaUIA(self, uia_client):
-		"""Find and cache the Discord message list UIA element.
+		"""Find and cache the Discord message list UIA element (main thread).
 
-		On a cache hit the expensive FindAll tree walk is skipped.
-		The cache is invalidated when the element's name changes
-		(channel switch) or when accessing it raises a COM exception.
+		Used by Alt+N shortcuts.  The background poll thread has its own
+		independent cache so COM objects are never shared across threads.
 		"""
 		if self._cachedMsgList:
 			cache_valid = False
 			with contextlib.suppress(Exception):
-				n = self._cachedMsgList.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
+				n = self._cachedMsgList.GetCurrentPropertyValue(
+					_UIA_NamePropertyId) or ""
 				cache_valid = bool(n and n == self._cachedMsgListName)
 			if cache_valid:
 				return self._cachedMsgList
@@ -534,51 +650,6 @@ class AppModule(appModuleHandler.AppModule):
 				self._cachedMsgListName = n
 				return elem
 		return None
-
-	def _getLatestMessageViaUIA(self):
-		"""Walk Discord's UIA tree and return text of the latest message."""
-		try:
-			import UIAHandler
-			uia_client = UIAHandler.handler.clientObject
-			if not uia_client:
-				return None
-
-			msgList = self._getMsgListViaUIA(uia_client)
-			if not msgList:
-				return None
-
-			walker = uia_client.RawViewWalker
-			child = walker.GetLastChildElement(msgList)
-
-			# If cached element is detached, retry
-			if not child and self._cachedMsgList is not None:
-				self._cachedMsgList = None
-				self._cachedMsgListName = None
-				msgList = self._getMsgListViaUIA(uia_client)
-				if not msgList:
-					return None
-				child = walker.GetLastChildElement(msgList)
-
-			# Walk backward from last child to find a named element
-			for _ in range(10):
-				if not child:
-					break
-				name = child.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
-				if name:
-					return name
-				# Check grandchildren
-				grandchild = walker.GetLastChildElement(child)
-				while grandchild:
-					gname = grandchild.GetCurrentPropertyValue(_UIA_NamePropertyId) or ""
-					if gname:
-						return gname
-					grandchild = walker.GetPreviousSiblingElement(grandchild)
-				child = walker.GetPreviousSiblingElement(child)
-
-			return None
-		except Exception as e:
-			log.warning("Discord Enhancements: getLatestMessage error: %s" % e)
-			return None
 
 	def _getMessagesViaUIA(self, count=10):
 		"""Walk the UIA tree and return up to *count* recent messages (oldest first)."""
