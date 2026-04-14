@@ -62,20 +62,6 @@ _TONE_ERROR = (150, 60)     # unknown key / error
 # ---------------------------------------------------------------------------
 _POLL_INTERVAL_MS = 500  # milliseconds between UIA polls
 
-# WinEvent constants for IAccessible fast-path hook
-EVENT_OBJECT_NAMECHANGE = 0x800C
-WINEVENT_OUTOFCONTEXT = 0x0000
-_WinEventProcType = ctypes.WINFUNCTYPE(
-	None,
-	ctypes.wintypes.HANDLE,
-	ctypes.wintypes.DWORD,
-	ctypes.wintypes.HWND,
-	ctypes.wintypes.LONG,
-	ctypes.wintypes.LONG,
-	ctypes.wintypes.DWORD,
-	ctypes.wintypes.DWORD,
-)
-
 # UIA property/type constants
 _UIA_NamePropertyId = 30005
 _UIA_ControlTypePropertyId = 30003
@@ -244,28 +230,11 @@ class AppModule(appModuleHandler.AppModule):
 		self._cachedMsgListName = None
 		self._discordHwnd = 0
 		self._terminated = False
-		self._lastHookTime = 0.0
-		self._lastUiaRead = 0.0
-
-		# WinEvent hook — fast-path trigger for immediate UIA reads
-		self._hookProc = _WinEventProcType(self._winEventCallback)
-		self._hook = ctypes.windll.user32.SetWinEventHook(
-			EVENT_OBJECT_NAMECHANGE,
-			EVENT_OBJECT_NAMECHANGE,
-			None,
-			self._hookProc,
-			self.processID,
-			0,
-			WINEVENT_OUTOFCONTEXT,
-		)
-		if self._hook:
-			log.info("Discord Enhancements: WinEvent hook registered")
-		else:
-			log.warning("Discord Enhancements: WinEvent hook failed")
+		self._lastInteractionTime = 0.0
 
 		# Background polling thread — UIA reads happen off the main
 		# thread so they never block keyboard/speech processing.
-		self._pollWakeEvent = threading.Event()
+		self._pollStopEvent = threading.Event()
 		self._pollThread = threading.Thread(
 			target=self._pollLoop, daemon=True, name="DiscordUiaPoll")
 		self._pollThread.start()
@@ -273,12 +242,9 @@ class AppModule(appModuleHandler.AppModule):
 
 	def terminate(self):
 		self._terminated = True
-		self._pollWakeEvent.set()  # wake thread so it exits
+		self._pollStopEvent.set()  # wake thread so it exits
 		if self._pollThread:
 			self._pollThread.join(timeout=2.0)
-		if getattr(self, '_hook', None):
-			ctypes.windll.user32.UnhookWinEvent(self._hook)
-			self._hook = None
 		if inputCore.manager._captureFunc == self._discordCaptor:
 			inputCore.manager._captureFunc = None
 		self._layerActive = False
@@ -434,44 +400,44 @@ class AppModule(appModuleHandler.AppModule):
 			return True
 
 	# ------------------------------------------------------------------
-	# WinEvent hook — fast-path trigger for message detection
-	# ------------------------------------------------------------------
-
-	def _winEventCallback(self, hHook, event, hwnd, idObject, idChild, thread, time_ms):
-		"""IAccessible nameChange hook — wakes the poll thread for an immediate read."""
-		try:
-			if not self._discordHwnd and hwnd:
-				self._discordHwnd = hwnd
-			self._lastHookTime = time.time()
-			# Debounce: skip if a UIA read ran within the last poll interval
-			if time.time() - self._lastUiaRead < _POLL_INTERVAL_MS / 1000.0:
-				return
-			self._pollWakeEvent.set()
-		except Exception:
-			pass
-
-	# ------------------------------------------------------------------
 	# UIA polling — background thread
 	# ------------------------------------------------------------------
 	# All UIA COM calls for polling happen on a daemon thread with its
 	# own COM client.  Only the final speech call is posted back to
 	# NVDA's main thread via core.callLater.
+	#
+	# PERFORMANCE DESIGN:
+	#   The message list element is cached after the first successful
+	#   lookup.  On subsequent polls only GetLastChildElement +
+	#   GetCurrentPropertyValue run — both O(1).  The expensive
+	#   FindAll(TreeScope_Descendants) only fires on cache miss
+	#   (app start, channel switch) and runs on this background
+	#   thread, so NVDA's main thread is never blocked.
 
 	def _pollLoop(self):
 		"""Background thread: poll Discord's UIA tree for new messages."""
-		comtypes.CoInitialize()
+		# MTA — no message pump required (STA would deadlock without one)
+		_COINIT_MULTITHREADED = 0x0
+		ctypes.windll.ole32.CoInitializeEx(None, _COINIT_MULTITHREADED)
 		uia_client = None
+		walker = None
 		cached_msg_list = None
 		cached_msg_list_name = None
+		list_condition = None
 
 		try:
 			while not self._terminated:
-				# Sleep up to 500ms, but wake early on WinEvent signal
-				self._pollWakeEvent.wait(_POLL_INTERVAL_MS / 1000.0)
-				self._pollWakeEvent.clear()
+				# Sleep for the poll interval; wake early if terminated
+				self._pollStopEvent.wait(_POLL_INTERVAL_MS / 1000.0)
 				if self._terminated:
 					break
 				if not self._shouldAnnounce():
+					continue
+
+				# Back off while the user is actively navigating so our
+				# cross-process UIA calls don't contend with NVDA's
+				# main-thread reads and cause speech delay.
+				if time.time() - self._lastInteractionTime < 1.0:
 					continue
 
 				# Check foreground via pure Win32 (no NVDA API needed)
@@ -497,13 +463,25 @@ class AppModule(appModuleHandler.AppModule):
 							uia_client = comtypes.CoCreateInstance(
 								UIA.CUIAutomation8._reg_clsid_,
 								interface=UIA.IUIAutomation,
+								clsctx=comtypes.CLSCTX_INPROC_SERVER,
 							)
 						except Exception:
 							uia_client = comtypes.CoCreateInstance(
 								UIA.CUIAutomation._reg_clsid_,
 								interface=UIA.IUIAutomation,
+								clsctx=comtypes.CLSCTX_INPROC_SERVER,
 							)
+						walker = uia_client.RawViewWalker
+						list_condition = uia_client.CreatePropertyCondition(
+							_UIA_ControlTypePropertyId,
+							_UIA_ListControlTypeId,
+						)
+						log.info("Discord poll thread: UIA client created")
 					except Exception:
+						log.error(
+							"Discord poll thread: UIA client creation failed",
+							exc_info=True,
+						)
 						continue
 
 				# Validate message list cache
@@ -518,18 +496,14 @@ class AppModule(appModuleHandler.AppModule):
 						cached_msg_list = None
 						cached_msg_list_name = None
 
-				# Find message list if not cached
+				# Find message list (cache miss only — rare)
 				if not cached_msg_list:
 					try:
 						root = uia_client.ElementFromHandle(fg_hwnd)
 						if not root:
 							continue
-						condition = uia_client.CreatePropertyCondition(
-							_UIA_ControlTypePropertyId,
-							_UIA_ListControlTypeId,
-						)
 						lists = root.FindAll(
-							_UIA_TreeScope_Descendants, condition)
+							_UIA_TreeScope_Descendants, list_condition)
 						if not lists or lists.Length == 0:
 							continue
 						found = False
@@ -547,44 +521,46 @@ class AppModule(appModuleHandler.AppModule):
 					except Exception:
 						continue
 
-				# Read the latest message
+				# Read the latest message — O(1) via cached list
+				# Minimise cross-process COM calls to avoid contention
+				# with NVDA's main-thread UIA reads.
 				try:
-					walker = uia_client.RawViewWalker
 					child = walker.GetLastChildElement(cached_msg_list)
 
 					if not child:
-						# Cache may be stale
 						cached_msg_list = None
 						cached_msg_list_name = None
 						continue
 
-					name = None
-					for _ in range(10):
-						if not child:
-							break
-						n = child.GetCurrentPropertyValue(
-							_UIA_NamePropertyId) or ""
-						if n:
-							name = n
-							break
-						gchild = walker.GetLastChildElement(child)
-						while gchild:
-							gn = gchild.GetCurrentPropertyValue(
-								_UIA_NamePropertyId) or ""
-							if gn:
-								name = gn
-								break
-							gchild = walker.GetPreviousSiblingElement(
-								gchild)
-						if name:
-							break
-						child = walker.GetPreviousSiblingElement(child)
+					name = child.GetCurrentPropertyValue(
+						_UIA_NamePropertyId) or ""
 
-					self._lastUiaRead = time.time()
+					# Message content may be nested one level deeper
+					if not name:
+						gchild = walker.GetLastChildElement(child)
+						if gchild:
+							name = gchild.GetCurrentPropertyValue(
+								_UIA_NamePropertyId) or ""
+
+					# Last child might be a separator; try previous sibling
+					if not name:
+						prev = walker.GetPreviousSiblingElement(child)
+						if prev:
+							name = prev.GetCurrentPropertyValue(
+								_UIA_NamePropertyId) or ""
+							if not name:
+								gchild = walker.GetLastChildElement(prev)
+								if gchild:
+									name = gchild.GetCurrentPropertyValue(
+										_UIA_NamePropertyId) or ""
+
 					if name and name != self._lastPollText:
 						self._lastPollText = name
 						core.callLater(0, self._filterAndAnnounce, name)
 
+				except COMError:
+					cached_msg_list = None
+					cached_msg_list_name = None
 				except Exception:
 					cached_msg_list = None
 					cached_msg_list_name = None
@@ -593,7 +569,7 @@ class AppModule(appModuleHandler.AppModule):
 			log.error("Discord poll loop crashed", exc_info=True)
 		finally:
 			with contextlib.suppress(Exception):
-				comtypes.CoUninitialize()
+				ctypes.windll.ole32.CoUninitialize()
 
 	# ------------------------------------------------------------------
 	# Main-thread UIA helpers (for Alt+N history reading)
@@ -861,12 +837,6 @@ class AppModule(appModuleHandler.AppModule):
 				self._filterAndAnnounce(text)
 		nextHandler()
 
-	def event_valueChange(self, obj, nextHandler):
-		"""Suppress Discord's edit-field clearing from cancelling announcement."""
-		if time.time() - self._lastHookTime < 2.0:
-			return
-		nextHandler()
-
 	# ------------------------------------------------------------------
 	# Master capture function -- handles ALL command-layer logic
 	# ------------------------------------------------------------------
@@ -880,6 +850,9 @@ class AppModule(appModuleHandler.AppModule):
 		Return False -> block the gesture (swallow it).
 		Return True  -> continue normal processing.
 		"""
+		# Track interaction time so the poll thread can back off
+		# during active navigation (avoids UIA COM contention).
+		self._lastInteractionTime = time.time()
 		try:
 			# If the command layer is active, handle the follow-up key
 			if self._layerActive:

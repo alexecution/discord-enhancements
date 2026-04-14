@@ -8,7 +8,6 @@
 #   3. Shows a conflict warning when the chosen prefix key is already
 #      bound to another gesture
 
-from io import StringIO
 from logHandler import log
 import config
 import globalPluginHandler
@@ -23,19 +22,17 @@ import wx
 # Configuration specification
 # ---------------------------------------------------------------------------
 
-_CONFIG_SPEC = """
-[discordAddon]
-	commandPrefix = string(default="[")
-	announceChatMessages = boolean(default=True)
-	verbosityLevel = integer(default=1, min=0, max=3)
-"""
+_CONFSPEC = {
+	"commandPrefix": 'string(default="[")',
+	"announceChatMessages": "boolean(default=True)",
+	"verbosityLevel": "integer(default=1, min=0, max=3)",
+}
 
 
 def _registerConfig():
 	"""Merge the add-on's config spec into NVDA's global config."""
 	try:
-		confspec = StringIO(_CONFIG_SPEC)
-		config.conf.spec.update(config.ConfigObj(confspec))
+		config.conf.spec["discordAddon"] = _CONFSPEC
 	except Exception:
 		log.error("Failed to register discordAddon config spec", exc_info=True)
 

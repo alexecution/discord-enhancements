@@ -390,12 +390,18 @@ def cmd_ping():
 def cmd_toggleAnnounce():
 	"""[ Shift+D — Toggle automatic incoming message announcements."""
 	import config
+	from logHandler import log
 	try:
 		current = config.conf["discordAddon"]["announceChatMessages"]
-		config.conf["discordAddon"]["announceChatMessages"] = not current
-		state = "off" if current else "on"
-	except (KeyError, Exception):
-		state = "toggled"
+	except KeyError:
+		log.warning("Discord toggle: config section missing, defaulting to True")
+		current = True
+	new_val = not current
+	try:
+		config.conf["discordAddon"]["announceChatMessages"] = new_val
+	except Exception:
+		log.error("Discord toggle: failed to write config", exc_info=True)
+	state = "on" if new_val else "off"
 	ui.message("Discord message announcements %s" % state)
 
 
